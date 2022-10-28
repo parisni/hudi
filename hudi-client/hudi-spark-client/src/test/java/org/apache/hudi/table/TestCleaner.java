@@ -773,33 +773,92 @@ public class TestCleaner extends HoodieClientTestBase {
       HoodieTestTable.of(metaClient).addCommit(commitTime);
     }
 
-    List<HoodieCleanStat> cleanStats = runCleaner(config);
+    int currentInstant = startInstant;
+
+    List<HoodieCleanStat> cleanStats = runCleaner(config, currentInstant++, false);
+    cleanCount++;
     HoodieActiveTimeline timeline = metaClient.reloadActiveTimeline();
+    timeline.getCleanerTimeline().filterCompletedInstants().lastInstant();
 
     assertEquals(0, cleanStats.size(), "Must not clean any files");
-    assertEquals(1, timeline.getTimelineOfActions(
-            CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterInflightsAndRequested().countInstants());
+    // the last clean commits should be deleted because they are empty
     assertEquals(0, timeline.getTimelineOfActions(
-            CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterInflights().countInstants());
+        CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterInflightsAndRequested().countInstants());
+    assertEquals(0, timeline.getTimelineOfActions(
+        CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterInflights().countInstants());
+    assertFalse(timeline.getTimelineOfActions(
+        CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).containsInstant(makeNewCommitTime(--instantClean, "%09d")));
+    // the completed clean count should be 20 (19 manual commits and 1 for the cleaner)
     assertEquals(--cleanCount, timeline.getTimelineOfActions(
-            CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterCompletedInstants().countInstants());
-    assertTrue(timeline.getTimelineOfActions(
-            CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterInflightsAndRequested().containsInstant(makeNewCommitTime(--instantClean, "%09d")));
+        CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterCompletedInstants().countInstants());
 
-    cleanStats = runCleaner(config);
+    cleanStats = runCleaner(config, currentInstant, false);
     timeline = metaClient.reloadActiveTimeline();
 
     assertEquals(0, cleanStats.size(), "Must not clean any files");
-    assertEquals(1, timeline.getTimelineOfActions(
-            CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterInflightsAndRequested().countInstants());
+    // no new inflight or request commits
     assertEquals(0, timeline.getTimelineOfActions(
-            CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterInflights().countInstants());
-    assertEquals(--cleanCount, timeline.getTimelineOfActions(
-            CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterCompletedInstants().countInstants());
+        CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterInflightsAndRequested().countInstants());
+    assertEquals(0, timeline.getTimelineOfActions(
+        CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterInflights().countInstants());
+    // the last clean should be skipped because there is no commit between it and the last commit
+    assertEquals(cleanCount, timeline.getTimelineOfActions(
+        CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterCompletedInstants().countInstants());
+    // the last clean commits should not be deleted because they are not empty
     assertTrue(timeline.getTimelineOfActions(
-            CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterInflightsAndRequested().containsInstant(makeNewCommitTime(--instantClean, "%09d")));
+        CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterCompletedInstants().containsInstant(makeNewCommitTime(41, "%09d")));
   }
-  
+
+  @Test
+  public void testCleanIncrementalModeWhenNoDeleteFiles() throws Exception {
+    HoodieWriteConfig config = HoodieWriteConfig.newBuilder().withPath(basePath)
+        .withMetadataConfig(HoodieMetadataConfig.newBuilder().withAssumeDatePartitioning(true).build())
+        .withCleanConfig(HoodieCleanConfig.newBuilder()
+            .withCleanerPolicy(HoodieCleaningPolicy.KEEP_LATEST_COMMITS)
+            .retainCommits(1)
+            .retainFileVersions(1)
+            .withIncrementalCleaningMode(true).build())
+        .build();
+
+    HoodieTableMetadataWriter metadataWriter = SparkHoodieBackedTableMetadataWriter.create(hadoopConf, config, context);
+    HoodieTestTable testTable = HoodieMetadataTestTable.of(metaClient, metadataWriter);
+    // make 3 commits, each with 1 file in a different partition
+    String file1P1C1 = UUID.randomUUID().toString();
+    String file2P2C2 = UUID.randomUUID().toString();
+    String file3P3C3 = UUID.randomUUID().toString();
+    String p1 = "2020/01/01";
+    String p2 = "2020/01/02";
+    String p3 = "2020/01/03";
+    String c1 = makeNewCommitTime(1, "%014d");
+    String c2 = makeNewCommitTime(2, "%014d");
+    String c3 = makeNewCommitTime(4, "%014d");
+
+    testTable.addCommit(c1).withBaseFilesInPartition(p1, file1P1C1);
+    List<HoodieCleanStat> cleanStats = runCleaner(config, 2, true);
+    // nothing to clean: cleanStats should be empty without any clean commit where nb of commits <= retained commits
+    assertEquals(0, cleanStats.size());
+    assertEquals(0, metaClient.getActiveTimeline().reload().getCleanerTimeline().countInstants());
+    assertFalse(metaClient.getActiveTimeline().reload().getTimelineOfActions(
+        CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterCompletedInstants().containsInstant(makeNewCommitTime(2, "%014d")));
+
+    testTable.addCommit(c2).withBaseFilesInPartition(p2, file2P2C2);
+    cleanStats = runCleaner(config, 3, true);
+    // nothing to clean: cleanStats should be empty but a clean commit should be created, and the last clean should be used to list the files to clean without errors
+    assertEquals(0, cleanStats.size());
+    assertEquals(1, metaClient.getActiveTimeline().reload().getCleanerTimeline().countInstants());
+    assertTrue(metaClient.getActiveTimeline().reload().getTimelineOfActions(
+        CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterCompletedInstants().containsInstant(makeNewCommitTime(3, "%014d")));
+
+
+    testTable.addCommit(c3).withBaseFilesInPartition(p3, file3P3C3);
+    cleanStats = runCleaner(config, 5, true);
+    // nothing to clean: cleanStats should be empty but a clean commit should be created, and the last clean should be used to list the files to clean without errors
+    assertEquals(0, cleanStats.size());
+    assertEquals(2, metaClient.getActiveTimeline().reload().getCleanerTimeline().countInstants());
+    assertTrue(metaClient.getActiveTimeline().reload().getTimelineOfActions(
+        CollectionUtils.createSet(HoodieTimeline.CLEAN_ACTION)).filterCompletedInstants().containsInstant(makeNewCommitTime(5, "%014d")));
+  }
+
   @Test
   public void testCleanWithReplaceCommits() throws Exception {
     HoodieWriteConfig config = HoodieWriteConfig.newBuilder().withPath(basePath)
@@ -819,9 +878,13 @@ public class TestCleaner extends HoodieClientTestBase {
     // make 1 commit, with 1 file per partition
     String file1P0C0 = UUID.randomUUID().toString();
     String file1P1C0 = UUID.randomUUID().toString();
-    testTable.addInflightCommit("00000000000001").withBaseFilesInPartition(p0, file1P0C0).withBaseFilesInPartition(p1, file1P1C0);
+    int currentInstant = 1;
 
-    HoodieCommitMetadata commitMetadata = generateCommitMetadata("00000000000001",
+    String writeCommitInstant = makeNewCommitTime(currentInstant++, "%014d");
+
+    testTable.addInflightCommit(writeCommitInstant).withBaseFilesInPartition(p0, file1P0C0).withBaseFilesInPartition(p1, file1P1C0);
+
+    HoodieCommitMetadata commitMetadata = generateCommitMetadata(writeCommitInstant,
         Collections.unmodifiableMap(new HashMap<String, List<String>>() {
           {
             put(p0, CollectionUtils.createImmutableList(file1P0C0));
@@ -829,77 +892,86 @@ public class TestCleaner extends HoodieClientTestBase {
           }
         })
     );
-    metadataWriter.update(commitMetadata, "00000000000001", false);
+    metadataWriter.update(commitMetadata, writeCommitInstant, false);
     metaClient.getActiveTimeline().saveAsComplete(
-        new HoodieInstant(State.INFLIGHT, HoodieTimeline.COMMIT_ACTION, "00000000000001"),
+        new HoodieInstant(State.INFLIGHT, HoodieTimeline.COMMIT_ACTION, writeCommitInstant),
         Option.of(commitMetadata.toJsonString().getBytes(StandardCharsets.UTF_8)));
 
     metaClient = HoodieTableMetaClient.reload(metaClient);
 
-    List<HoodieCleanStat> hoodieCleanStatsOne = runCleanerWithInstantFormat(config, true);
+    // run the cleaner
+    // notice that cleaner generates inflight, request and complete commit files
+    List<HoodieCleanStat> hoodieCleanStatsOne = runCleaner(config, currentInstant++, true);
     assertEquals(0, hoodieCleanStatsOne.size(), "Must not scan any partitions and clean any files");
-    assertTrue(testTable.baseFileExists(p0, "00000000000001", file1P0C0));
-    assertTrue(testTable.baseFileExists(p1, "00000000000001", file1P1C0));
+    assertTrue(testTable.baseFileExists(p0, writeCommitInstant, file1P0C0));
+    assertTrue(testTable.baseFileExists(p1, writeCommitInstant, file1P1C0));
 
     // make next replacecommit, with 1 clustering operation. logically delete p0. No change to p1
     // notice that clustering generates empty inflight commit files
-    Map<String, String> partitionAndFileId002 = testTable.forReplaceCommit("00000000000002").getFileIdsWithBaseFilesInPartitions(p0);
+    String replaceCommitInstantOne = makeNewCommitTime(currentInstant++, "%014d");
+    Map<String, String> partitionAndFileId002 = testTable.forReplaceCommit(replaceCommitInstantOne).getFileIdsWithBaseFilesInPartitions(p0);
     String file2P0C1 = partitionAndFileId002.get(p0);
     Pair<HoodieRequestedReplaceMetadata, HoodieReplaceCommitMetadata> replaceMetadata =
-        generateReplaceCommitMetadata("00000000000002", p0, file1P0C0, file2P0C1);
-    testTable.addReplaceCommit("00000000000002", Option.of(replaceMetadata.getKey()), Option.empty(), replaceMetadata.getValue());
+        generateReplaceCommitMetadata(replaceCommitInstantOne, p0, file1P0C0, file2P0C1);
+    testTable.addReplaceCommit(replaceCommitInstantOne, Option.of(replaceMetadata.getKey()), Option.empty(), replaceMetadata.getValue());
 
     // run cleaner
-    List<HoodieCleanStat> hoodieCleanStatsTwo = runCleanerWithInstantFormat(config, true);
+    // notice that cleaner generates inflight, request and complete commit files
+    List<HoodieCleanStat> hoodieCleanStatsTwo = runCleaner(config, currentInstant++, true);
     assertEquals(0, hoodieCleanStatsTwo.size(), "Must not scan any partitions and clean any files");
-    assertTrue(testTable.baseFileExists(p0, "00000000000002", file2P0C1));
-    assertTrue(testTable.baseFileExists(p0, "00000000000001", file1P0C0));
-    assertTrue(testTable.baseFileExists(p1, "00000000000001", file1P1C0));
+    assertTrue(testTable.baseFileExists(p0, replaceCommitInstantOne, file2P0C1));
+    assertTrue(testTable.baseFileExists(p0, writeCommitInstant, file1P0C0));
+    assertTrue(testTable.baseFileExists(p1, writeCommitInstant, file1P1C0));
 
     // make next replacecommit, with 1 clustering operation. Replace data in p1. No change to p0
     // notice that clustering generates empty inflight commit files
-    Map<String, String> partitionAndFileId003 = testTable.forReplaceCommit("00000000000003").getFileIdsWithBaseFilesInPartitions(p1);
+    String replaceCommitInstantTwo = makeNewCommitTime(currentInstant++, "%014d");
+    Map<String, String> partitionAndFileId003 = testTable.forReplaceCommit(replaceCommitInstantTwo).getFileIdsWithBaseFilesInPartitions(p1);
     String file3P1C2 = partitionAndFileId003.get(p1);
-    replaceMetadata = generateReplaceCommitMetadata("00000000000003", p1, file1P1C0, file3P1C2);
-    testTable.addReplaceCommit("00000000000003", Option.of(replaceMetadata.getKey()), Option.empty(), replaceMetadata.getValue());
+    replaceMetadata = generateReplaceCommitMetadata(replaceCommitInstantTwo, p1, file1P1C0, file3P1C2);
+    testTable.addReplaceCommit(replaceCommitInstantTwo, Option.of(replaceMetadata.getKey()), Option.empty(), replaceMetadata.getValue());
 
-    // run cleaner
-    List<HoodieCleanStat> hoodieCleanStatsThree = runCleanerWithInstantFormat(config, true);
+    // run the cleaner
+    // notice that cleaner generates inflight, request and complete commit files
+    List<HoodieCleanStat> hoodieCleanStatsThree = runCleaner(config, currentInstant++, true);
     assertEquals(0, hoodieCleanStatsThree.size(), "Must not scan any partitions and clean any files");
-    assertTrue(testTable.baseFileExists(p0, "00000000000002", file2P0C1));
-    assertTrue(testTable.baseFileExists(p0, "00000000000001", file1P0C0));
-    assertTrue(testTable.baseFileExists(p1, "00000000000003", file3P1C2));
-    assertTrue(testTable.baseFileExists(p1, "00000000000001", file1P1C0));
+    assertTrue(testTable.baseFileExists(p0, replaceCommitInstantOne, file2P0C1));
+    assertTrue(testTable.baseFileExists(p0, writeCommitInstant, file1P0C0));
+    assertTrue(testTable.baseFileExists(p1, replaceCommitInstantTwo, file3P1C2));
+    assertTrue(testTable.baseFileExists(p1, writeCommitInstant, file1P1C0));
 
     // make next replacecommit, with 1 clustering operation. Replace data in p0 again
     // notice that clustering generates empty inflight commit files
-    Map<String, String> partitionAndFileId004 = testTable.forReplaceCommit("00000000000004").getFileIdsWithBaseFilesInPartitions(p0);
+    String replaceCommitInstantTree = makeNewCommitTime(currentInstant++, "%014d");
+    Map<String, String> partitionAndFileId004 = testTable.forReplaceCommit(replaceCommitInstantTree).getFileIdsWithBaseFilesInPartitions(p0);
     String file4P0C3 = partitionAndFileId004.get(p0);
-    replaceMetadata = generateReplaceCommitMetadata("00000000000004", p0, file2P0C1, file4P0C3);
-    testTable.addReplaceCommit("00000000000004", Option.of(replaceMetadata.getKey()), Option.empty(), replaceMetadata.getValue());
+    replaceMetadata = generateReplaceCommitMetadata(replaceCommitInstantTree, p0, file2P0C1, file4P0C3);
+    testTable.addReplaceCommit(replaceCommitInstantTree, Option.of(replaceMetadata.getKey()), Option.empty(), replaceMetadata.getValue());
 
-    // run cleaner
-    List<HoodieCleanStat> hoodieCleanStatsFour = runCleaner(config, 5, true);
-    assertTrue(testTable.baseFileExists(p0, "00000000000004", file4P0C3));
-    assertTrue(testTable.baseFileExists(p0, "00000000000002", file2P0C1));
-    assertTrue(testTable.baseFileExists(p1, "00000000000003", file3P1C2));
-    assertFalse(testTable.baseFileExists(p0, "00000000000001", file1P0C0));
+    // run the cleaner
+    // notice that cleaner generates inflight, request and complete commit files
+    List<HoodieCleanStat> hoodieCleanStatsFour = runCleaner(config, currentInstant++, true);
+    assertTrue(testTable.baseFileExists(p0, replaceCommitInstantTree, file4P0C3));
+    assertTrue(testTable.baseFileExists(p0, replaceCommitInstantOne, file2P0C1));
+    assertTrue(testTable.baseFileExists(p1, replaceCommitInstantTwo, file3P1C2));
+    assertFalse(testTable.baseFileExists(p0, writeCommitInstant, file1P0C0));
     //file1P1C0 still stays because its not replaced until 3 and its the only version available
-    assertTrue(testTable.baseFileExists(p1, "00000000000001", file1P1C0));
+    assertTrue(testTable.baseFileExists(p1, writeCommitInstant, file1P1C0));
 
     // make next replacecommit, with 1 clustering operation. Replace all data in p1. no new files created
     // notice that clustering generates empty inflight commit files
-    Map<String, String> partitionAndFileId005 = testTable.forReplaceCommit("00000000000006").getFileIdsWithBaseFilesInPartitions(p1);
+    String replaceCommitInstantFour = makeNewCommitTime(currentInstant++, "%014d");
+    Map<String, String> partitionAndFileId005 = testTable.forReplaceCommit(replaceCommitInstantFour).getFileIdsWithBaseFilesInPartitions(p1);
     String file4P1C4 = partitionAndFileId005.get(p1);
-    replaceMetadata = generateReplaceCommitMetadata("00000000000006", p0, file3P1C2, file4P1C4);
-    testTable.addReplaceCommit("00000000000006", Option.of(replaceMetadata.getKey()), Option.empty(), replaceMetadata.getValue());
+    replaceMetadata = generateReplaceCommitMetadata(replaceCommitInstantFour, p0, file3P1C2, file4P1C4);
+    testTable.addReplaceCommit(replaceCommitInstantFour, Option.of(replaceMetadata.getKey()), Option.empty(), replaceMetadata.getValue());
 
     List<HoodieCleanStat> hoodieCleanStatsFive = runCleaner(config, 7, true);
-    assertTrue(testTable.baseFileExists(p0, "00000000000004", file4P0C3));
-    assertTrue(testTable.baseFileExists(p0, "00000000000002", file2P0C1));
-    assertTrue(testTable.baseFileExists(p1, "00000000000003", file3P1C2));
-    assertFalse(testTable.baseFileExists(p0, "00000000000001", file1P0C0));
-    assertFalse(testTable.baseFileExists(p1, "00000000000001", file1P1C0));
+    assertTrue(testTable.baseFileExists(p0, replaceCommitInstantTree, file4P0C3));
+    assertTrue(testTable.baseFileExists(p0, replaceCommitInstantOne, file2P0C1));
+    assertTrue(testTable.baseFileExists(p1, replaceCommitInstantTwo, file3P1C2));
+    assertFalse(testTable.baseFileExists(p0, writeCommitInstant, file1P0C0));
+    assertFalse(testTable.baseFileExists(p1, writeCommitInstant, file1P1C0));
   }
 
   private Pair<HoodieRequestedReplaceMetadata, HoodieReplaceCommitMetadata> generateReplaceCommitMetadata(

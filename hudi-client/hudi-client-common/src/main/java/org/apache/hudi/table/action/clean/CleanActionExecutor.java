@@ -31,7 +31,9 @@ import org.apache.hudi.common.model.CleanFileInfo;
 import org.apache.hudi.common.model.HoodieRecordPayload;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.TimelineMetadataUtils;
+import org.apache.hudi.common.table.timeline.versioning.clean.CleanMetadataV2MigrationHandler;
 import org.apache.hudi.common.util.CleanerUtils;
+import org.apache.hudi.common.util.CollectionUtils;
 import org.apache.hudi.common.util.HoodieTimer;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ValidationUtils;
@@ -206,25 +208,36 @@ public class CleanActionExecutor<T extends HoodieRecordPayload, I, K, O> extends
       } else {
         inflightInstant = cleanInstant;
       }
-
-      List<HoodieCleanStat> cleanStats = clean(context, cleanerPlan);
-      if (cleanStats.isEmpty()) {
-        return HoodieCleanMetadata.newBuilder().build();
+      boolean needsClean = ((cleanerPlan.getFilePathsToBeDeletedPerPartition() != null)
+          && !cleanerPlan.getFilePathsToBeDeletedPerPartition().isEmpty()
+          && cleanerPlan.getFilePathsToBeDeletedPerPartition().values().stream().mapToInt(List::size).sum() > 0);
+      HoodieCleanMetadata metadata;
+      if (needsClean) {
+        List<HoodieCleanStat> cleanStats = clean(context, cleanerPlan);
+        table.getMetaClient().reloadActiveTimeline();
+        metadata = CleanerUtils.convertCleanMetadata(
+            inflightInstant.getTimestamp(),
+            Option.of(timer.endTimer()),
+            cleanStats
+        );
+      } else {
+        LOG.info("No need to run the cleaner");
+        HoodieActionInstant actionInstant = cleanerPlan.getEarliestInstantToRetain();
+        HoodieInstant earliestCommitToRetain = actionInstant != null ? new HoodieInstant(
+            HoodieInstant.State.valueOf(actionInstant.getState()), actionInstant.getAction(), actionInstant.getTimestamp()) : null;
+        metadata = new HoodieCleanMetadata(inflightInstant.getTimestamp(), Option.of(timer.endTimer()).orElseGet(() -> -1L), 0, earliestCommitToRetain.getTimestamp(),
+            cleanerPlan.getLastCompletedCommitTimestamp(), CollectionUtils.createImmutableMap(), CleanMetadataV2MigrationHandler.VERSION, CollectionUtils.createImmutableMap());
       }
 
-      table.getMetaClient().reloadActiveTimeline();
-      HoodieCleanMetadata metadata = CleanerUtils.convertCleanMetadata(
-          inflightInstant.getTimestamp(),
-          Option.of(timer.endTimer()),
-          cleanStats
-      );
       if (!skipLocking) {
         this.txnManager.beginTransaction(Option.of(inflightInstant), Option.empty());
       }
       writeTableMetadata(metadata, inflightInstant.getTimestamp());
       table.getActiveTimeline().transitionCleanInflightToComplete(inflightInstant,
           TimelineMetadataUtils.serializeCleanMetadata(metadata));
-      LOG.info("Marked clean started on " + inflightInstant.getTimestamp() + " as complete");
+      if (needsClean) {
+        LOG.info("Marked clean started on " + inflightInstant.getTimestamp() + " as complete");
+      }
       return metadata;
     } catch (IOException e) {
       throw new HoodieIOException("Failed to clean up after commit", e);
@@ -253,6 +266,13 @@ public class CleanActionExecutor<T extends HoodieRecordPayload, I, K, O> extends
       pendingCleanInstants.forEach(hoodieInstant -> {
         if (table.getCleanTimeline().isEmpty(hoodieInstant)) {
           table.getActiveTimeline().deleteEmptyInstantIfExists(hoodieInstant);
+          // if the empty commit is inflight, check if request commit is empty too and delete it
+          if (hoodieInstant.getState() == HoodieInstant.State.INFLIGHT) {
+            HoodieInstant requestInstant = new HoodieInstant(HoodieInstant.State.REQUESTED, hoodieInstant.getAction(), hoodieInstant.getTimestamp());
+            if (table.getCleanTimeline().isEmpty(requestInstant)) {
+              table.getActiveTimeline().deleteEmptyInstantIfExists(requestInstant);
+            }
+          }
         } else {
           LOG.info("Finishing previously unfinished cleaner instant=" + hoodieInstant);
           try {
