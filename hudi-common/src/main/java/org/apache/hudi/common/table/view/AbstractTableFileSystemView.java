@@ -737,6 +737,21 @@ public abstract class AbstractTableFileSystemView implements SyncableFileSystemV
     }
   }
 
+  @Override
+  public final Stream<Pair<String, List<HoodieFileGroup>>> getAllFileGroups(List<String> partitionPaths) {
+    return getAllFileGroupsIncludingReplaced(partitionPaths)
+      .map(pair -> Pair.of(pair.getLeft(), pair.getRight().stream().filter(fg -> !isFileGroupReplaced(fg)).collect(Collectors.toList())));
+  }
+
+  private Stream<Pair<String, List<HoodieFileGroup>>> getAllFileGroupsIncludingReplaced(final List<String> partitionStrList) {
+    List<Pair<String, List<HoodieFileGroup>>> fileGroupPerPartitionList = new ArrayList<>();
+    for (String partitionStr : partitionStrList) {
+      fileGroupPerPartitionList.add(Pair.of(partitionStr, getAllFileGroupsIncludingReplaced(partitionStr).collect(Collectors.toList())));
+    }
+    return fileGroupPerPartitionList.stream();
+  }
+
+
   /**
    * Ensure there is consistency in handling trailing slash in partition-path. Always trim it which is what is done in
    * other places.
