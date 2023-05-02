@@ -75,6 +75,7 @@ import org.apache.spark.sql.SparkSession;
 import java.io.IOException;
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -100,6 +101,9 @@ public class HoodieDeltaStreamer implements Serializable {
 
   private static final long serialVersionUID = 1L;
   private static final Logger LOG = LogManager.getLogger(HoodieDeltaStreamer.class);
+  private static final List<String> DEFAULT_SENSITIVE_CONFIG_KEYS = Arrays.asList(
+      HoodieWriteConfig.SENSITIVE_CONFIG_KEYS_FILTER.defaultValue().split(","));
+  private static final String SENSITIVE_VALUES_MASKED = "SENSITIVE_INFO_MASKED";
 
   public static final String CHECKPOINT_KEY = HoodieWriteConfig.DELTASTREAMER_CHECKPOINT_KEY;
   public static final String CHECKPOINT_RESET_KEY = "deltastreamer.checkpoint.reset_key";
@@ -175,7 +179,12 @@ public class HoodieDeltaStreamer implements Serializable {
   }
 
   public void shutdownGracefully() {
-    deltaSyncService.ifPresent(ds -> ds.shutdown(false));
+    deltaSyncService.ifPresent(ds -> {
+      LOG.info("Shutting down DeltaStreamer");
+      ds.shutdown(false);
+      LOG.info("Async service shutdown complete. Closing DeltaSync ");
+      ds.close();
+    });
   }
 
   /**
@@ -296,8 +305,9 @@ public class HoodieDeltaStreamer implements Serializable {
         + "Default: No limit, e.g: DFS-Source => max bytes to read, Kafka-Source => max events to read")
     public long sourceLimit = Long.MAX_VALUE;
 
-    @Parameter(names = {"--op"}, description = "Takes one of these values : UPSERT (default), INSERT (use when input "
-        + "is purely new data/inserts to gain speed)", converter = OperationConverter.class)
+    @Parameter(names = {"--op"}, description = "Takes one of these values : UPSERT (default), INSERT, "
+        + "BULK_INSERT, INSERT_OVERWRITE, INSERT_OVERWRITE_TABLE, DELETE_PARTITION",
+        converter = OperationConverter.class)
     public WriteOperationType operation = WriteOperationType.UPSERT;
 
     @Parameter(names = {"--filter-dupes"},
@@ -528,7 +538,10 @@ public class HoodieDeltaStreamer implements Serializable {
     }
   }
 
-  private static String toSortedTruncatedString(TypedProperties props) {
+  static String toSortedTruncatedString(TypedProperties props) {
+    List<String> sensitiveConfigList = props.getStringList(HoodieWriteConfig.SENSITIVE_CONFIG_KEYS_FILTER.key(),
+        ",", DEFAULT_SENSITIVE_CONFIG_KEYS);
+
     List<String> allKeys = new ArrayList<>();
     for (Object k : props.keySet()) {
       allKeys.add(k.toString());
@@ -541,6 +554,12 @@ public class HoodieDeltaStreamer implements Serializable {
       if (value.length() > 255 && !LOG.isDebugEnabled()) {
         value = value.substring(0, 128) + "[...]";
       }
+
+      // Mask values for security/ credentials and other sensitive configs
+      if (sensitiveConfigList.stream().anyMatch(key::contains)) {
+        value = SENSITIVE_VALUES_MASKED;
+      }
+
       propsLog.append(key).append(": ").append(value).append("\n");
     }
     return propsLog.toString();
@@ -737,12 +756,13 @@ public class HoodieDeltaStreamer implements Serializable {
                 }
               }
               // check if deltastreamer need to be shutdown
-              if (postWriteTerminationStrategy.isPresent()) {
-                if (postWriteTerminationStrategy.get().shouldShutdown(scheduledCompactionInstantAndRDD.isPresent() ? Option.of(scheduledCompactionInstantAndRDD.get().getRight()) :
+              if (postWriteTerminationStrategy.isPresent()
+                  && postWriteTerminationStrategy.get().shouldShutdown(scheduledCompactionInstantAndRDD.isPresent() ? Option.of(scheduledCompactionInstantAndRDD.get().getRight()) :
                     Option.empty())) {
-                  error = true;
-                  shutdown(false);
-                }
+                LOG.warn("Closing and shutting down ingestion service");
+                error = true;
+                close();
+                shutdown(true);
               }
               long toSleepMs = cfg.minSyncIntervalSeconds * 1000 - (System.currentTimeMillis() - start);
               if (toSleepMs > 0) {

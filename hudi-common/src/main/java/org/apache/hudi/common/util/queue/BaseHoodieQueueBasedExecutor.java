@@ -49,7 +49,7 @@ import static org.apache.hudi.common.util.ValidationUtils.checkState;
  * is ingested from multiple sources (ie producers) into a singular sink (ie consumer), using
  * an internal queue to stage the records ingested from producers before these are consumed
  */
-public abstract class BaseHoodieQueueBasedExecutor<I, O, E> implements HoodieExecutor<I, O, E> {
+public abstract class BaseHoodieQueueBasedExecutor<I, O, E> implements HoodieExecutor<E> {
 
   private static final long TERMINATE_WAITING_TIME_SECS = 60L;
 
@@ -74,7 +74,7 @@ public abstract class BaseHoodieQueueBasedExecutor<I, O, E> implements HoodieExe
     this.producers = producers;
     this.consumer = consumer;
     // Ensure fixed thread for each producer thread
-    this.producerExecutorService = Executors.newFixedThreadPool(producers.size(), new CustomizedThreadFactory("executor-queue-producer", preExecuteRunnable));
+    this.producerExecutorService = Executors.newFixedThreadPool(Math.max(1, producers.size()), new CustomizedThreadFactory("executor-queue-producer", preExecuteRunnable));
     // Ensure single thread for consumer
     this.consumerExecutorService = Executors.newSingleThreadExecutor(new CustomizedThreadFactory("executor-queue-consumer", preExecuteRunnable));
   }
@@ -92,6 +92,8 @@ public abstract class BaseHoodieQueueBasedExecutor<I, O, E> implements HoodieExe
   }
 
   protected abstract void doConsume(HoodieMessageQueue<I, O> queue, HoodieConsumer<O, E> consumer);
+
+  protected void setUp() {}
 
   /**
    * Start producing
@@ -165,6 +167,7 @@ public abstract class BaseHoodieQueueBasedExecutor<I, O, E> implements HoodieExe
   public E execute() {
     try {
       checkState(this.consumer.isPresent());
+      setUp();
       // Start consuming/producing asynchronously
       CompletableFuture<Void> consuming = startConsumingAsync();
       CompletableFuture<Void> producing = startProducingAsync();

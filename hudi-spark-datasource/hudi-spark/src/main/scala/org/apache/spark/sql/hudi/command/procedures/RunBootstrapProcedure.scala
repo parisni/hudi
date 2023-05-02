@@ -34,6 +34,7 @@ import java.util
 import java.util.Locale
 import java.util.function.Supplier
 
+import scala.collection.JavaConverters._
 class RunBootstrapProcedure extends BaseProcedure with ProcedureBuilder with Logging {
   private val PARAMETERS = Array[ProcedureParameter](
     ProcedureParameter.required(0, "table", DataTypes.StringType, None),
@@ -117,13 +118,9 @@ class RunBootstrapProcedure extends BaseProcedure with ProcedureBuilder with Log
     cfg.setEnableHiveSync(enableHiveSync)
     cfg.setBootstrapOverwrite(bootstrapOverwrite)
 
-    try {
-      new BootstrapExecutorUtils(cfg, jsc, fs, jsc.hadoopConfiguration, properties).execute()
-    } catch {
-      case e: Exception =>
-        logWarning(s"Run bootstrap failed due to", e)
-        Seq(Row(-1))
-    }
+    // add session bootstrap conf
+    properties.putAll(spark.sqlContext.conf.getAllConfs.asJava)
+    new BootstrapExecutorUtils(cfg, jsc, fs, jsc.hadoopConfiguration, properties).execute()
     Seq(Row(0))
   }
 
